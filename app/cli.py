@@ -17,7 +17,13 @@ numerów) — analogicznie, w zakresie --od/--do/--rodzaj:
     .venv\\Scripts\\python.exe -m app.cli --nip 5252445719 --od 2026-06-01 --do 2026-06-30 ^
         --rodzaj sprzedaz --cel C:\\eksport-ksef --kontrahent 9100010014 --kontrahent 42
 
-Kod wyjścia:
+Odświeżenie plików czekających na import (bez tokena, np. z Harmonogramu zadań
+co kilka minut) — numery kart nowych kontrahentów wg bieżącej kartoteki FK,
+patrz app/swiezosc.py; kod wyjścia 0/1/2 — patrz _odswiez_pliki:
+
+    .venv\\Scripts\\python.exe -m app.cli --nip 5252445719 --odswiez-pliki BETALABO
+
+Kod wyjścia (eksport):
     0 — eksport pełny, bez błędów;
     1 — eksport pełny, ale są faktury z błędem mapowania (BŁĄD …) albo nietrafione
         wyszukiwanie — do ręcznej obsługi;
@@ -44,11 +50,35 @@ from app.exporter import Kind, run_export
 from app.kontrahenci_nr import RejestrNumerow, SynchronizacjaOdrzucona
 from app.ksef_client import KsefClient
 from app.ledger import Ledger
+from app.swiezosc import PlikiDoImportu, odswiez_pliki
 from app.symfonia_sql import SymfoniaSqlError
 
 
 def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
+
+
+def _odswiez_pliki(nip: str, baza: str) -> int:
+    """--odswiez-pliki: kod 0 — pliki zgodne albo poprawione, 1 — plik mógł już
+    zostać zaimportowany ze złym kontem (sprawdź dekret), 2 — błąd bazy/
+    synchronizacji albo zapisu pliku."""
+    rejestr = RejestrNumerow()
+    pliki = PlikiDoImportu()
+    try:
+        raport = odswiez_pliki(nip, baza, rejestr, pliki)
+    except (SymfoniaSqlError, SynchronizacjaOdrzucona) as exc:
+        print(f"Odświeżanie plików ({baza}) nie powiodło się: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        rejestr.close()
+        pliki.close()
+    for linia in raport.jako_tekst():
+        print(linia)
+    if not raport.jako_tekst():
+        print(f"Pliki czekające na import: {raport.sprawdzone}, zgodne z kartoteką.")
+    if raport.bledy:
+        return 2
+    return 1 if any(z.mozliwie_zaimportowany for z in raport.zmiany) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         "--rodzaj", default="koszt,sprzedaz",
         help="koszt, sprzedaz lub oba po przecinku (domyślnie oba)",
     )
-    parser.add_argument("--cel", required=True, help="Folder docelowy eksportu")
+    parser.add_argument("--cel", default=None, help="Folder docelowy eksportu (wymagany poza --odswiez-pliki)")
     parser.add_argument("--podfolder", default=None, help="Podfolder profilu (domyślnie NIP)")
     parser.add_argument("--baza", default=PROD_BASE_URL, help="Base URL API (domyślnie produkcja)")
     parser.add_argument(
@@ -183,9 +213,20 @@ def main(argv: list[str] | None = None) -> int:
         "--test-api", action="store_true",
         help="Tylko smoke test API (bez tokena) i koniec",
     )
+    parser.add_argument(
+        "--odswiez-pliki", dest="odswiez_pliki", default=None, metavar="BAZA",
+        help="Tylko odśwież pliki czekające na import (numery kart nowych kontrahentów "
+             "wg bieżącej kartoteki w bazie Symfonii BAZA) i koniec — bez tokena, "
+             "np. z Harmonogramu zadań co kilka minut",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.odswiez_pliki:
+        return _odswiez_pliki(args.nip, args.odswiez_pliki)
+    if not args.cel:
+        parser.error("wymagany argument: --cel")
 
     if args.test_api:
         client = KsefClient(args.baza, args.nip, "brak")
@@ -221,6 +262,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.sync_sql:
+        # plik z tego eksportu będzie odświeżany wg tej bazy (--odswiez-pliki)
+        profile.db_symfonia = args.sync_sql
         rejestr_sql = RejestrNumerow()
         try:
             raport_sql = rejestr_sql.synchronizuj_z_sql(profile.nip, args.sync_sql)

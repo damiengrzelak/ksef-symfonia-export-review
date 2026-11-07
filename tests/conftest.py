@@ -14,8 +14,9 @@ def isolated_app_data(tmp_path, monkeypatch):
     import app.kontrahenci_nr
     import app.ledger
     import app.quota
+    import app.swiezosc
 
     data_dir = tmp_path / "appdata"
-    for module in (app.config, app.ledger, app.quota, app.kontrahenci_nr):
+    for module in (app.config, app.ledger, app.quota, app.kontrahenci_nr, app.swiezosc):
         monkeypatch.setattr(module, "app_data_dir", lambda d=data_dir: d)
     return data_dir

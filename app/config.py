@@ -55,6 +55,10 @@ class Profile:
     # (stary profil sprzed tej funkcji albo jeszcze nigdy nie eksportowano).
     ostatnie_od: str = ""
     ostatnie_do: str = ""
+    # klucz API inFakt TEJ firmy (nagłówek X-inFakt-ApiKey; uprawnienia
+    # api:invoices:read + api:invoices:write) — zaszyfrowany w config.enc jak
+    # token KSeF; puste = firma bez inFaktu
+    infakt_api_key: str = ""
 
     def masked_token(self) -> str:
         return (self.token[:6] + "…") if self.token else "(brak)"

@@ -45,6 +45,7 @@ from app.ksef_client import (
     warsaw_midnight_iso,
 )
 from app.ledger import STATUS_DO_RECZNEJ, STATUS_W_PLIKU, LateRecord, Ledger
+from app.swiezosc import KartaWPliku, PlikiDoImportu
 
 logger = logging.getLogger(__name__)
 
@@ -673,6 +674,7 @@ def run_export(
     konto_koszt_vat: str = "221-1",
     konto_koszt_netto: str = "",
     termin_fallback_dni: int = 14,
+    pliki_importu: PlikiDoImportu | None = None,
 ) -> ExportReport:
     """Eksport per profil.
 
@@ -705,6 +707,11 @@ def run_export(
     `termin_fallback_dni` (tylko hmffk) — gdy faktura nie ma TerminPlatnosci
     w FA(3), map_fa3_to_hmffk liczy termin jako data wystawienia + tyle dni,
     żeby rozrachunek (sekcja transakcja{}) i tak powstał automatycznie w FK.
+
+    `pliki_importu` (tylko hmffk, profil z `db_symfonia`) — rejestr plików
+    czekających na import (app.swiezosc); zapisany plik jest w nim rejestrowany
+    z kartami i kontami, żeby odświeżanie mogło poprawić numery kart, gdy
+    kartoteka FK zmieni się przed importem. Gdy nie podany — tworzony lokalnie.
 
     `invoice_numbers` — tryb wyszukiwania po numerze faktury WYSTAWCY (nie
     numerze KSeF). KSeF nie umie szukać po tym numerze, więc pobierane są
@@ -1570,6 +1577,7 @@ def run_export(
             hmffk_kh = swiezy
 
             # numeracja kart FK: max+1 (jak FK), w kolejności sekcji Kontrahent{}
+            karty_pliku: list[KartaWPliku] = []  # do śledzenia świeżości (app.swiezosc)
             for karta in hmffk_kh.lista():
                 nr = rejestr.pozycja(profile.nip, karta.klucz)
                 nowy = nr is None
@@ -1652,6 +1660,7 @@ def run_export(
                     report.nowi_kontrahenci.append(
                         (karta.nazwa, karta.nip, nr, ", ".join(konta_karty))
                     )
+                karty_pliku.append(KartaWPliku(karta.klucz, karta.nazwa, nr, konta_karty))
             if report.nowi_kontrahenci:
                 # (10) numery kart już nadane (przydziel zapisał je w rejestrze
                 # numerów) — ostrzeżenie czeka w rejestrze pobranych, aż trafi do
@@ -1687,6 +1696,15 @@ def run_export(
                 zapisane.add(meta.ksef_number)
                 if already:
                     report.re_exported += 1
+            if profile.db_symfonia:
+                # plik czeka na import — numery kart pilnuje app.swiezosc (odświeża
+                # plik, gdy ktoś założy kartę w Symfonii przed importem)
+                pliki = pliki_importu or PlikiDoImportu()
+                try:
+                    pliki.zarejestruj(profile.nip, txt_path, karty_pliku)
+                finally:
+                    if pliki_importu is None:
+                        pliki.close()
             report.exported += len(hmffk_docs)
             report.kontrahenci = len(hmffk_kh)
             # nowi z tego przebiegu + zaległe z przebiegu, którego plik nie powstał

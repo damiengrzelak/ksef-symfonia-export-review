@@ -348,6 +348,21 @@ przecinkami/spacjami; w CLI: `--kontrahent ID` (wielokrotnie) albo
   i w `dist\...\_internal\reference\symfonia-szablony\`): identyczny szablon
   z `#DANEKH "1"`. Podmień szablon w profilu importu w Symfonii i porównaj
   zachowanie na 1 fakturze od nieznanego dostawcy.
+- **Świeżość plików czekających na import** (`app/swiezosc.py`): plik hmffk
+  przewiduje numery kart nowych kontrahentów (max+1). Gdy ktoś założy kartę
+  ręcznie w Symfonii PRZED importem pliku, numery by się rozjechały. Dlatego
+  każdy plik zapisany dla profilu z ustawioną „Bazą Symfonii (SQL)” jest
+  rejestrowany (`%APPDATA%\KsefSymfoniaExport\pliki_importu.db`), a aplikacja
+  **sama co minutę** (i przy starcie okna) porównuje go z kartoteką FK i w razie
+  potrzeby przepisuje linie `Konto =` oraz rejestr numerów — bez okienek, tylko
+  wpis w logu. Okno ostrzegawcze pojawia się wyłącznie, gdy karta jest już
+  w Symfonii z innym numerem niż w pliku (plik mógł zostać zaimportowany ze
+  złym kontem — sprawdź dekret). Przycisk **„Odśwież pliki do importu”** robi
+  to samo od razu. Plik przestaje być śledzony po imporcie (wszystkie karty
+  w FK z numerami z pliku), po usunięciu z dysku albo po 30 dniach. Bez
+  otwartej aplikacji: `python -m app.cli --nip <NIP> --odswiez-pliki <BAZA>`
+  (np. z Harmonogramu zadań co kilka minut; kod wyjścia 0 — zgodne/poprawione,
+  1 — sprawdź dekret, 2 — błąd bazy lub zapisu).
 - Rejestr pobranych faktur (dedup): `%APPDATA%\KsefSymfoniaExport\ledger.db` —
   ta sama faktura nie zostanie wyeksportowana drugi raz.
 - Faktury niemożliwe do automatycznego zaksięgowania (procedura marży, OSS,

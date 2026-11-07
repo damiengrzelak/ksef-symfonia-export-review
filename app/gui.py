@@ -11,7 +11,7 @@ from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QObject, Qt, QThread, Signal
+from PySide6.QtCore import QDate, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemDelegate,
@@ -62,9 +62,14 @@ from app.kontrahenci_nr import (
 )
 from app.ksef_client import KsefClient
 from app.ledger import Ledger
+from app.swiezosc import PlikiDoImportu, RaportOdswiezenia, odswiez_pliki
 from app.symfonia_sql import SymfoniaSqlError, lista_baz
 
 logger = logging.getLogger(__name__)
+
+# co ile automatycznie sprawdzać, czy pliki czekające na import są zgodne
+# z kartoteką Symfonii (app.swiezosc) — bez oczekujących plików nie ma zapytań
+ODSWIEZANIE_CO_MS = 60_000
 
 
 def nip_valid(nip: str) -> bool:
@@ -256,7 +261,7 @@ class MasterPasswordDialog(QDialog):
         self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
         info = (
-            "Ustaw hasło główne. Szyfruje ono tokeny KSeF zapisane na dysku.\n"
+            "Ustaw hasło główne. Szyfruje ono tokeny KSeF i klucze API inFakt zapisane na dysku.\n"
             "Zapamiętaj je — bez niego konfiguracja jest nie do odzyskania."
             if first_run
             else "Podaj hasło główne, aby odblokować konfigurację."
@@ -295,6 +300,7 @@ class ProfileDialog(QDialog):
         self.setWindowTitle("Profil firmy")
         self.setMinimumWidth(460)
         self._existing_token = profile.token if profile else ""
+        self._existing_infakt_key = profile.infakt_api_key if profile else ""
         self._existing_konta_override = dict(profile.konta_override) if profile else {}
         # zakres dat Od/Do zapamiętany dla TEJ firmy (patrz Profile.ostatnie_od/_do
         # i app/gui.py::_zakres_dla_profilu) — dialog nie ma pól do jego edycji,
@@ -315,6 +321,21 @@ class ProfileDialog(QDialog):
         form.addRow("Nazwa firmy:", self.name)
         form.addRow("NIP:", self.nip)
         form.addRow("Token KSeF:", self.token)
+        self.infakt_key = QLineEdit(echoMode=QLineEdit.EchoMode.Password)
+        self.infakt_key.setPlaceholderText(
+            "(zapisany — bez zmian)" if self._existing_infakt_key
+            else "opcjonalnie — tylko firmy wystawiające faktury w inFakcie"
+        )
+        self.infakt_key.setToolTip(
+            "Klucz API z inFaktu: Ustawienia → Inne opcje → API, uprawnienia\n"
+            "api:invoices:read i api:invoices:write. Zapisywany zaszyfrowany\n"
+            "hasłem głównym, jak token KSeF."
+        )
+        form.addRow("Klucz API inFakt:", self.infakt_key)
+        self.chk_usun_infakt = QCheckBox("Usuń zapisany klucz inFakt")
+        self.chk_usun_infakt.setVisible(bool(self._existing_infakt_key))
+        self.chk_usun_infakt.toggled.connect(lambda on: self.infakt_key.setEnabled(not on))
+        form.addRow("", self.chk_usun_infakt)
         form.addRow("Podfolder:", self.subfolder)
 
         self.db_symfonia_combo: QComboBox | None = None
@@ -390,7 +411,18 @@ class ProfileDialog(QDialog):
         if not self._existing_token and not self.token.text().strip():
             QMessageBox.warning(self, "Profil", "Podaj token KSeF (uprawnienie: przeglądanie faktur).")
             return
+        if any(c.isspace() for c in self.infakt_key.text().strip()):
+            QMessageBox.warning(
+                self, "Profil",
+                "Klucz API inFakt nie może zawierać spacji — skopiuj go z inFaktu ponownie.",
+            )
+            return
         self.accept()
+
+    def _wynikowy_klucz_infakt(self) -> str:
+        if self.chk_usun_infakt.isChecked():
+            return ""
+        return self.infakt_key.text().strip() or self._existing_infakt_key
 
     def result_profile(self) -> Profile:
         nip = "".join(c for c in self.nip.text() if c.isdigit())
@@ -403,6 +435,7 @@ class ProfileDialog(QDialog):
             sql_autosync=self.chk_sql_autosync.isChecked(),
             ostatnie_od=self._existing_ostatnie_od,
             ostatnie_do=self._existing_ostatnie_do,
+            infakt_api_key=self._wynikowy_klucz_infakt(),
         )
 
 
@@ -1890,6 +1923,40 @@ class ExportWorker(QObject):
                 ledger.close()
 
 
+class OdswiezanieWorker(QObject):
+    """Odświeżenie plików czekających na import (app.swiezosc) dla wszystkich
+    profili ze skonfigurowaną bazą Symfonii i auto-synchronizacją. Błąd jednego
+    profilu nie zatrzymuje pozostałych."""
+
+    finished = Signal(object)  # list[tuple[str, RaportOdswiezenia | None, str]]
+
+    def __init__(self, profiles: list[Profile]):
+        super().__init__()
+        self._profiles = [p for p in profiles if p.db_symfonia and p.sql_autosync]
+
+    def run(self):
+        wyniki: list[tuple[str, RaportOdswiezenia | None, str]] = []
+        rejestr = pliki = None
+        try:
+            rejestr = RejestrNumerow()
+            pliki = PlikiDoImportu()
+            for p in self._profiles:
+                try:
+                    raport = odswiez_pliki(p.nip, p.db_symfonia, rejestr, pliki)
+                    wyniki.append((p.name, raport, ""))
+                except (SymfoniaSqlError, SynchronizacjaOdrzucona) as exc:
+                    wyniki.append((p.name, None, str(exc)))
+                except Exception as exc:  # noqa: BLE001 — wątek roboczy nie może umrzeć cicho
+                    logger.exception("Nieoczekiwany błąd odświeżania plików")
+                    wyniki.append((p.name, None, str(exc)))
+        finally:
+            if rejestr is not None:
+                rejestr.close()
+            if pliki is not None:
+                pliki.close()
+        self.finished.emit(wyniki)
+
+
 class _GuiLogBridge(QObject, logging.Handler):
     """Most logging -> sygnał Qt (bezpieczny między wątkami)."""
 
@@ -1915,6 +1982,9 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: ExportWorker | None = None
         self._cancel = threading.Event()
+        self._odsw_thread: QThread | None = None
+        self._odsw_worker: OdswiezanieWorker | None = None
+        self._odsw_reczne = False
 
         # wersja w tytule: od razu widać, który commit działa u księgowej
         # (pusta dla spakowanego .exe — tytuł jak dotąd)
@@ -2045,6 +2115,13 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.btn_export)
         action_row.addWidget(self.btn_cancel)
         action_row.addStretch()
+        self.btn_odswiez = QPushButton("Odśwież pliki do importu")
+        self.btn_odswiez.setToolTip(
+            "Program sam co minutę sprawdza, czy pliki czekające na import są zgodne\n"
+            "z kartoteką Symfonii (np. ktoś ręcznie dodał kontrahenta) i w razie\n"
+            "potrzeby poprawia w nich numery kart. Ten przycisk robi to od razu."
+        )
+        action_row.addWidget(self.btn_odswiez)
         right.addLayout(action_row)
 
         self.progress = QProgressBar()
@@ -2078,6 +2155,11 @@ class MainWindow(QMainWindow):
         self.target_dir.editingFinished.connect(self._save_target)
         self.btn_export.clicked.connect(self._start_export)
         self.btn_cancel.clicked.connect(self._cancel_export)
+        self.btn_odswiez.clicked.connect(lambda: self._start_odswiezanie(reczne=True))
+        self._odsw_timer = QTimer(self)
+        self._odsw_timer.timeout.connect(self._start_odswiezanie)
+        self._odsw_timer.start(ODSWIEZANIE_CO_MS)
+        QTimer.singleShot(0, self._start_odswiezanie)
 
         # logi -> widok
         self._log_bridge = _GuiLogBridge()
@@ -2206,10 +2288,88 @@ class MainWindow(QMainWindow):
 
     # -- eksport --------------------------------------------------------------
 
+    # -- świeżość plików czekających na import ----------------------------------
+
+    def _start_odswiezanie(self, reczne: bool = False):
+        """Odświeżenie w tle (timer co ODSWIEZANIE_CO_MS, start okna, przycisk).
+        Pomijane w trakcie eksportu i gdy poprzednie odświeżanie jeszcze trwa —
+        oba korzystają z rejestru numerów."""
+        if self._odsw_thread is not None or (
+            self._thread is not None and self._thread.isRunning()
+        ):
+            if reczne:
+                self.log_view.appendPlainText(
+                    "Odświeżanie plików: trwa eksport albo poprzednie sprawdzenie — "
+                    "spróbuj za chwilę."
+                )
+            return
+        if not any(p.db_symfonia and p.sql_autosync for p in self.cfg.profiles):
+            if reczne:
+                QMessageBox.information(
+                    self, "Odśwież pliki do importu",
+                    "Żaden profil nie ma ustawionej bazy Symfonii (SQL) z automatyczną "
+                    "synchronizacją — ustaw ją w edycji profilu firmy.",
+                )
+            return
+        self._odsw_reczne = reczne
+        self.btn_odswiez.setEnabled(False)
+        self._odsw_thread = QThread(self)
+        self._odsw_worker = OdswiezanieWorker(list(self.cfg.profiles))
+        self._odsw_worker.moveToThread(self._odsw_thread)
+        self._odsw_thread.started.connect(self._odsw_worker.run)
+        self._odsw_worker.finished.connect(self._on_odswiezanie)
+        self._odsw_worker.finished.connect(self._odsw_thread.quit)
+        self._odsw_thread.finished.connect(self._odsw_thread.deleteLater)
+        self._odsw_thread.start()
+
+    def _on_odswiezanie(self, wyniki: list):
+        self._odsw_thread = None
+        self._odsw_worker = None
+        self.btn_odswiez.setEnabled(True)
+        linie: list[str] = []
+        do_sprawdzenia: list[str] = []
+        sprawdzone = 0
+        for nazwa, raport, blad in wyniki:
+            if raport is None:
+                linie.append(f"{nazwa}: odświeżanie plików nie powiodło się: {blad}")
+                continue
+            sprawdzone += raport.sprawdzone
+            linie += [f"{nazwa}: {t}" for t in raport.jako_tekst()]
+            do_sprawdzenia += [
+                f"{nazwa}: {z.nazwa} — w pliku {z.plik.name} było {z.stary}, karta w "
+                f"Symfonii ma {z.nowy}"
+                for z in raport.zmiany if z.mozliwie_zaimportowany
+            ]
+        if linie:
+            self.log_view.appendPlainText("\n".join(linie))
+        if do_sprawdzenia:
+            # jedyny przypadek wymagający uwagi: plik mógł już zostać zaimportowany
+            # ze złym kontem — reszta poprawia się sama i ląduje tylko w logu
+            QMessageBox.warning(
+                self, "Sprawdź konto rozrachunkowe",
+                "Kartoteka w Symfonii ma inne numery kart niż plik czekający na import. "
+                "Plik został poprawiony. Jeśli był JUŻ zaimportowany, sprawdź konto "
+                "rozrachunkowe dokumentów tych kontrahentów:\n\n" + "\n".join(do_sprawdzenia),
+            )
+        elif self._odsw_reczne:
+            if linie:
+                tresc = "Gotowe — szczegóły w logu."
+            elif sprawdzone:
+                tresc = "Pliki czekające na import są zgodne z kartoteką Symfonii."
+            else:
+                tresc = "Brak plików czekających na import."
+            QMessageBox.information(self, "Odśwież pliki do importu", tresc)
+
     def _start_export(self):
         profile = self._selected_profile()
         if profile is None:
             QMessageBox.warning(self, "Eksport", "Dodaj i wybierz profil firmy.")
+            return
+        if self._odsw_thread is not None:
+            QMessageBox.information(
+                self, "Eksport",
+                "Trwa sprawdzanie plików czekających na import — spróbuj za kilka sekund.",
+            )
             return
         kinds: set[Kind] = set()
         if self.chk_sales.isChecked():
@@ -2270,6 +2430,7 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool):
         self.btn_export.setEnabled(not running)
         self.btn_cancel.setEnabled(running)
+        self.btn_odswiez.setEnabled(not running and self._odsw_thread is None)
         for w in (self.btn_add, self.btn_edit, self.btn_del, self.btn_kontrahenci,
                   self.profile_list, self.date_from, self.date_to, self.chk_sales,
                   self.chk_cost, self.chk_hmffk, self.chk_combined, self.chk_only_new,
@@ -2424,5 +2585,9 @@ class MainWindow(QMainWindow):
             self._cancel.set()
             self._thread.quit()
             self._thread.wait(5000)
+        self._odsw_timer.stop()
+        if self._odsw_thread is not None:
+            self._odsw_thread.quit()
+            self._odsw_thread.wait(5000)
         logging.getLogger().removeHandler(self._log_bridge)
         event.accept()

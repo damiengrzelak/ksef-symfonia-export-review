@@ -484,6 +484,40 @@ class RejestrNumerow:
         self._conn.commit()
         return poz
 
+    def przenumeruj(self, profil_nip: str, nowe: dict[str, int]) -> None:
+        """Zbiorczo ustawia pozycje wpisów (klucz -> pozycja) bez zmiany statusu;
+        brakujący wpis dochodzi jako 'auto'. Przez tymczasowe ujemne pozycje
+        w jednej transakcji — zamiana miejscami nie narusza unikalnego indeksu
+        (profil_nip, pozycja). Wywołujący odpowiada za to, że docelowe pozycje
+        nie są zajęte przez wpisy spoza `nowe` (app.swiezosc numeruje powyżej
+        max rejestru)."""
+        zmiany = {k: p for k, p in nowe.items() if self.pozycja(profil_nip, k) != p}
+        if not zmiany:
+            return
+        try:
+            temp = -1
+            for klucz in zmiany:
+                self._conn.execute(
+                    "UPDATE numery SET pozycja=? WHERE profil_nip=? AND klucz=?",
+                    (temp, profil_nip, klucz),
+                )
+                temp -= 1
+            for klucz, pozycja in zmiany.items():
+                cur = self._conn.execute(
+                    "UPDATE numery SET pozycja=? WHERE profil_nip=? AND klucz=?",
+                    (pozycja, profil_nip, klucz),
+                )
+                if cur.rowcount == 0:
+                    self._conn.execute(
+                        "INSERT INTO numery(profil_nip, klucz, pozycja, status, added_at) "
+                        "VALUES (?, ?, ?, 'auto', ?)",
+                        (profil_nip, klucz, pozycja, _now()),
+                    )
+        except Exception:
+            self._conn.rollback()
+            raise
+        self._conn.commit()
+
     def ustaw(
         self,
         profil_nip: str,
@@ -1263,7 +1297,13 @@ class RejestrNumerow:
         wyszedł identyczny jak z plikowego seedu/emisji hmffk (bez tego wpisy
         z SQL dostawały klucze z surowym NIP-em, np. 'PL9100010037', rozjeżdżające
         się z kluczem kanonicznym '9100010037' i duplikujące karty w FK)."""
-        wiersze = _czytaj_kartoteke_sql(baza)
+        return self.synchronizuj_z_wierszy(profil_nip, _czytaj_kartoteke_sql(baza), wymus=wymus)
+
+    def synchronizuj_z_wierszy(
+        self, profil_nip: str, wiersze: list[dict], wymus: bool = False
+    ) -> RaportSync:
+        """synchronizuj_z_sql dla wierszy kartoteki już odczytanych z bazy
+        (format app.symfonia_sql.czytaj_kartoteke) — bez ponownego zapytania."""
         ostrzezenia: list[str] = []
 
         fk: dict[str, tuple[int, str, str, str]] = {}

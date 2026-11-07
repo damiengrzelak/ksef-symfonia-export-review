@@ -299,3 +299,36 @@ def test_konta_dla_termin_fallback_dni_smieciowa_wartosc(tmp_path):
     profil = Profile("Firma", "1231231231", "t", "f", konta_override={"termin_fallback_dni": "abc"})
     efektywne = cfg.konta_dla(profil)
     assert efektywne["termin_fallback_dni"] == cfg.termin_fallback_dni
+
+
+def test_profil_klucz_infakt_zaszyfrowany_roundtrip(tmp_path):
+    """Klucz API inFakt trzyma się profilu, przeżywa save/unlock i — jak token
+    KSeF — nie leży na dysku jawnym tekstem."""
+    path = tmp_path / "config.enc"
+    store = ConfigStore(path)
+    cfg = store.initialize("haslo-infakt")
+    cfg.profiles.append(Profile(
+        "Firma A", "5252445719", "token", "fa", infakt_api_key="klucz-infakt-abc123"
+    ))
+    cfg.profiles.append(Profile("Firma B", "1112223344", "token", "fb"))
+    store.save(cfg)
+
+    assert "klucz-infakt-abc123" not in path.read_text(encoding="utf-8")
+    loaded = ConfigStore(path).unlock("haslo-infakt")
+    assert loaded.profiles[0].infakt_api_key == "klucz-infakt-abc123"
+    assert loaded.profiles[1].infakt_api_key == ""
+
+
+def test_profil_bez_klucza_infakt_ze_starego_configu(tmp_path):
+    """Config zapisany przed dodaniem klucza inFakt otwiera się z pustym kluczem."""
+    path = tmp_path / "config.enc"
+    store = ConfigStore(path)
+    store.initialize("haslo")
+    store.save(AppConfig(profiles=[Profile("Stara", "9998887766", "t", "sf")]))
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    dane = json.loads(store._fernet.decrypt(envelope["payload"].encode("ascii")))
+    del dane["profiles"][0]["infakt_api_key"]
+    envelope["payload"] = store._fernet.encrypt(json.dumps(dane).encode("utf-8")).decode("ascii")
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+
+    assert ConfigStore(path).unlock("haslo").profiles[0].infakt_api_key == ""

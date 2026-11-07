@@ -628,3 +628,133 @@ def test_profile_dialog_nowy_profil_ma_pusty_zakres(qapp):
         dlg.close()
     assert nowy.ostatnie_od == ""
     assert nowy.ostatnie_do == ""
+
+
+# --------------------------------------------------------------------------- #
+# Świeżość plików czekających na import (app/swiezosc.py) w oknie głównym
+
+
+class _OdswiezanieBezWatku(gui_mod.OdswiezanieWorker):
+    """Prawdziwy OdswiezanieWorker, ale bez przenoszenia do wątku — _FakeThread
+    (no_real_export) wywołuje run() synchronicznie."""
+
+    def moveToThread(self, thread):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _odswiezanie_bez_watku(monkeypatch):
+    monkeypatch.setattr(gui_mod, "OdswiezanieWorker", _OdswiezanieBezWatku)
+
+
+def _okno_z_baza(tmp_path):
+    store = ConfigStore(tmp_path / "config.enc")
+    cfg = store.initialize("haslo-odswiezanie")
+    cfg.profiles.append(Profile("FirmaA", "1112223344", "tok1", "fa", db_symfonia="GAMMATEST"))
+    store.save(cfg)
+    return MainWindow(store, cfg)
+
+
+def test_odswiezanie_reczne_pliki_zgodne(tmp_path, qapp, no_dialogs, no_real_export, monkeypatch):
+    from app.swiezosc import RaportOdswiezenia
+
+    wywolania = []
+
+    def fake_odswiez(nip, baza, rejestr, pliki):
+        wywolania.append((nip, baza))
+        return RaportOdswiezenia(sprawdzone=1)
+
+    monkeypatch.setattr(gui_mod, "odswiez_pliki", fake_odswiez)
+    win = _okno_z_baza(tmp_path)
+    try:
+        qapp.processEvents()  # automatyczne sprawdzenie przy starcie okna
+        assert wywolania == [("1112223344", "GAMMATEST")]
+        assert no_dialogs.calls == []  # automatyczne: bez okienek
+
+        win.btn_odswiez.click()
+        assert len(wywolania) == 2
+        assert no_dialogs.calls == [
+            ("information", ("Odśwież pliki do importu",
+                             "Pliki czekające na import są zgodne z kartoteką Symfonii."))
+        ]
+        assert win.btn_odswiez.isEnabled()
+    finally:
+        win.close()
+        qapp.processEvents()
+
+
+def test_odswiezanie_automatyczne_ostrzega_tylko_gdy_plik_mogl_byc_zaimportowany(
+    tmp_path, qapp, no_dialogs, no_real_export, monkeypatch
+):
+    from pathlib import Path
+
+    from app.swiezosc import RaportOdswiezenia, ZmianaNumeru
+
+    plik = Path("hmffk_fa.TXT")
+    raporty = [
+        RaportOdswiezenia(sprawdzone=1, zmiany=[ZmianaNumeru(plik, "Gamma", 3, 4)]),
+        RaportOdswiezenia(sprawdzone=1, zmiany=[
+            ZmianaNumeru(plik, "Delta", 5, 7, mozliwie_zaimportowany=True)
+        ]),
+    ]
+    monkeypatch.setattr(gui_mod, "odswiez_pliki", lambda *a: raporty.pop(0))
+    win = _okno_z_baza(tmp_path)
+    try:
+        qapp.processEvents()
+        # zwykłe przenumerowanie: tylko log, żadnego okienka
+        assert no_dialogs.calls == []
+        assert "Gamma 3 -> 4" in win.log_view.toPlainText()
+
+        win._start_odswiezanie()  # tick timera
+        assert [rodzaj for rodzaj, _ in no_dialogs.calls] == ["warning"]
+        assert "Delta" in no_dialogs.calls[0][1][1]
+    finally:
+        win.close()
+        qapp.processEvents()
+
+
+def test_odswiezanie_pomijane_w_trakcie_eksportu(tmp_path, qapp, no_dialogs, no_real_export, monkeypatch):
+    wywolania = []
+    monkeypatch.setattr(gui_mod, "odswiez_pliki", lambda *a: wywolania.append(a))
+    win = _okno_z_baza(tmp_path)
+    try:
+        win._thread = SimpleNamespace(isRunning=lambda: True)
+        win._start_odswiezanie()
+        qapp.processEvents()
+        assert wywolania == []
+    finally:
+        win._thread = None
+        win.close()
+        qapp.processEvents()
+
+
+def test_profile_dialog_klucz_infakt_wpisany_zachowany_i_usuniety(qapp, no_dialogs):
+    """Klucz inFakt: wpisany trafia do profilu; puste pole przy edycji = bez zmian;
+    „Usuń zapisany klucz” czyści; klucz ze spacją jest odrzucany."""
+    dlg = ProfileDialog()
+    try:
+        assert not dlg.chk_usun_infakt.isVisibleTo(dlg)  # nowy profil: nie ma czego usuwać
+        dlg.name.setText("Firma A")
+        dlg.nip.setText("5260250274")
+        dlg.token.setText("token")
+        dlg.infakt_key.setText("  klucz-abc  ")
+        nowy = dlg.result_profile()
+    finally:
+        dlg.close()
+    assert nowy.infakt_api_key == "klucz-abc"
+
+    dlg = ProfileDialog(nowy)
+    try:
+        assert dlg.infakt_key.echoMode() == dlg.infakt_key.EchoMode.Password
+        assert dlg.infakt_key.text() == ""  # klucz nie jest pokazywany
+        assert dlg.chk_usun_infakt.isVisibleTo(dlg)
+        assert dlg.result_profile().infakt_api_key == "klucz-abc"
+        dlg.chk_usun_infakt.setChecked(True)
+        assert dlg.result_profile().infakt_api_key == ""
+        dlg.chk_usun_infakt.setChecked(False)
+        dlg.infakt_key.setText("klucz z spacja")
+        dlg._accept()
+        assert dlg.result() != dlg.DialogCode.Accepted
+        assert no_dialogs.calls and "spacji" in no_dialogs.calls[-1][1][1]
+    finally:
+        dlg.close()
